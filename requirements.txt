@@ -4,3 +4,4 @@ requests
 pypdf
 urllib3
 aiohttp
+aiofiles

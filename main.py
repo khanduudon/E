@@ -1,376 +1,1241 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Pinnacle Ebook Merged PDF Bot - Standalone (Heroku/Server Ready)
-"""
+import asyncio
+import aiohttp
 
-import os, re, asyncio, logging
+import os
+import json
+import time
+import random
 from datetime import datetime
-from typing import List
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-from pypdf import PdfWriter
-from pyrogram import Client, filters
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
-from pyrogram.errors import FloodWait
+from urllib.parse import quote_plus, urlparse
+import re
+from concurrent.futures import ThreadPoolExecutor
+from typing import List, Dict, Optional, Tuple
+import logging
+from dataclasses import dataclass
+from abc import ABC, abstractmethod
+import aiofiles
+import aiofiles.os
+from bs4 import BeautifulSoup
+import ssl
+from fake_useragent import UserAgent
 
-# ───────────────── CONFIG ─────────────────
-# ✅ अपना Bot Token, API ID और API Hash यहाँ डालें
-BOT_TOKEN = "8646009620:AAHW_ABhXrfBo2sMtQ2_CBTV0Ak9KhWVuiA"
-API_ID = 22370234       # अपना API ID डालें
-API_HASH = "706badded011715ae115e5ab3bf83f87" # अपना API Hash डालें
+# Telegram imports
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Document
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+from telegram.constants import ParseMode
 
-APP_NAME = "Pinnacle Ebook"
-EBOOKS_API = "https://auth.ssccglpinnacle.com/api/ebooksforactive?active=true"
-EBOOK_CHAPTERS_API = "https://auth.ssccglpinnacle.com/api/chapters-ebook/{book_id}"
-EBOOK_PDFS_API = "https://auth.ssccglpinnacle.com/api/pdfs-ebook/{chapter_id}"
-CLOUDFRONT_BASE = "https://dzdx39zg243ni.cloudfront.net/{s3_key}"
-OUTPUT_DIR = "downloads"
+# Configure logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-# Pinnacle Auth Token
-AUTH_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjY5NWI0MmJjNzQwZGFkMjQzN2I1NzhlYiIsInJvbGUiOiJzdHVkZW50IiwiaXAiOiIxNTIuNTkuMTcuOTAiLCJkZXZpY2UiOiJNb3ppbGxhLzUuMCAoV2luZG93cyBOVCAxMC4wOyBXaW42NDsgeDY0KSBBcHBsZVdlYktpdC81MzcuMzYgKEtIVE1MLCBsaWtlIEdlY2tvKSBDaHJvbWUvMTUwLjAuMC4wIFNhZmFyaS81MzcuMzYiLCJpYXQiOjE3ODQxNzg2MzYsImV4cCI6MTg0NzI1MDYzNn0.z4e1LKkpvkxCvjqlipVg_wrwffeCt4dZidr6yuLfy6o"
-
-HEADERS = {
-    "accept": "*/*",
-    "accept-language": "en-US,en;q=0.9",
-    "origin": "https://ebooks.ssccglpinnacle.com",
-    "referer": "https://ebooks.ssccglpinnacle.com/",
-    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
-    "authorization": f"Bearer {AUTH_TOKEN}"
+# Configuration
+CONFIG = {
+    "telegram_token": os.environ.get("TELEGRAM_TOKEN", "8658937403:AAHVNDzbKXUhjKKDRvdcqAxdWtJo-JRay3A"),
+    "max_concurrent_searches": 10,
+    "default_results_per_engine": 50,
+    "timeout": 30,
+    "max_file_size": 5 * 1024 * 1024,  # 5MB
+    "proxy_list": [
+        # Add your proxies here in format: "http://user:pass@host:port" or "socks5://user:pass@host:port"
+    ],
+    "request_delay": (1, 3),  # Random delay between requests in seconds
+    "max_retries": 3,
+    "use_tor": False,  # Set to True if you want to use Tor
+    "tor_port": 9050
 }
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
-log = logging.getLogger("PinnacleBot")
+@dataclass
+class SearchResult:
+    title: str
+    url: str
+    snippet: str
+    engine: str
 
-# ───────────────── HELPERS ─────────────────
-def create_session():
-    session = requests.Session()
-    retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[401, 403, 429, 500, 502, 503, 504])
-    adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=retry)
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-    session.headers.update(HEADERS)
-    return session
+@dataclass
+class SearchProgress:
+    total: int
+    completed: int
+    current_engine: str
+    message_id: int
 
-def fetch_json(url, timeout=15):
-    try:
-        sess = create_session()
-        r = sess.get(url, timeout=timeout)
-        if r.status_code in [401, 403]:
-            log.error(f"{r.status_code} Forbidden/Unauthorized: {url}")
-            return None
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        log.error(f"fetch_json error: {e}")
-        return None
+class SearchEngine(ABC):
+    """Abstract base class for search engines"""
+    
+    @abstractmethod
+    async def search(self, query: str, num_results: int = 50, proxy: Optional[str] = None) -> List[SearchResult]:
+        pass
 
-def sanitize(name):
-    if not name: return "ebook"
-    name = re.sub(r'[\\/*?:"<>|]', "", str(name))
-    name = re.sub(r'\s+', '_', name.strip())
-    return name[:80] or "ebook"
+class GoogleSearchEngine(SearchEngine):
+    """Google search implementation using scraping"""
+    
+    def __init__(self):
+        self.base_url = "https://www.google.com/search"
+        self.ua = UserAgent()
+    
+    async def search(self, query: str, num_results: int = 50, proxy: Optional[str] = None) -> List[SearchResult]:
+        results = []
+        headers = {
+            "User-Agent": self.ua.random,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Referer": "https://www.google.com/",
+            "DNT": "1",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1"
+        }
+        
+        # Configure proxy if provided
+        proxy_config = None
+        if proxy:
+            proxy_config = proxy
+        elif CONFIG["use_tor"]:
+            proxy_config = f"socks5://127.0.0.1:{CONFIG['tor_port']}"
+        
+        connector = None
+        if proxy_config:
+            connector = aiohttp.TCPConnector()
+        
+        async with aiohttp.ClientSession(connector=connector) as session:
+            # Calculate number of pages needed
+            results_per_page = 10
+            pages_needed = min((num_results + results_per_page - 1) // results_per_page, 5)  # Max 5 pages
+            
+            for page in range(pages_needed):
+                start = page * 10
+                params = {
+                    "q": query,
+                    "start": start,
+                    "num": results_per_page,
+                    "hl": "en",
+                    "gl": "us",
+                    "ie": "utf8",
+                    "oe": "utf8"
+                }
+                
+                retries = 0
+                while retries < CONFIG["max_retries"]:
+                    try:
+                        # Random delay to avoid detection
+                        await asyncio.sleep(random.uniform(*CONFIG["request_delay"]))
+                        
+                        async with session.get(
+                            self.base_url,
+                            params=params,
+                            headers=headers,
+                            proxy=proxy_config,
+                            timeout=aiohttp.ClientTimeout(total=CONFIG["timeout"]),
+                            ssl=False
+                        ) as response:
+                            if response.status != 200:
+                                logger.warning(f"Google returned status {response.status}")
+                                retries += 1
+                                continue
+                            
+                            html = await response.text()
+                            soup = BeautifulSoup(html, 'html.parser')
+                            
+                            # Parse search results
+                            search_divs = soup.find_all('div', class_='g')
+                            
+                            for div in search_divs:
+                                # Extract title and URL
+                                title_elem = div.find('h3')
+                                if not title_elem:
+                                    continue
+                                
+                                title = title_elem.get_text()
+                                
+                                # Extract URL
+                                link_elem = div.find('a')
+                                if not link_elem or not link_elem.has_attr('href'):
+                                    continue
+                                
+                                url = link_elem['href']
+                                if url.startswith('/url?q='):
+                                    url = url.split('/url?q=')[1].split('&sa=')[0]
+                                
+                                # Extract snippet
+                                snippet_elem = div.find('span', {'data-ved': True})
+                                if not snippet_elem:
+                                    snippet_elem = div.find('div', class_='VwiC3b')
+                                
+                                snippet = snippet_elem.get_text() if snippet_elem else ""
+                                
+                                results.append(SearchResult(
+                                    title=title,
+                                    url=url,
+                                    snippet=snippet,
+                                    engine="Google"
+                                ))
+                                
+                                if len(results) >= num_results:
+                                    return results
+                            
+                            # If we got results, break the retry loop
+                            break
+                            
+                    except Exception as e:
+                        logger.error(f"Error searching Google: {e}")
+                        retries += 1
+                        await asyncio.sleep(2 ** retries)  # Exponential backoff
+        
+        return results
 
-def truncate(title, n=50):
-    if not title: return ""
-    title = str(title).strip()
-    return title if len(title) <= n else title[:n-3] + "..."
+class BingSearchEngine(SearchEngine):
+    """Bing search implementation using scraping"""
+    
+    def __init__(self):
+        self.base_url = "https://www.bing.com/search"
+        self.ua = UserAgent()
+    
+    async def search(self, query: str, num_results: int = 50, proxy: Optional[str] = None) -> List[SearchResult]:
+        results = []
+        headers = {
+            "User-Agent": self.ua.random,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Referer": "https://www.bing.com/",
+            "DNT": "1",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1"
+        }
+        
+        # Configure proxy if provided
+        proxy_config = None
+        if proxy:
+            proxy_config = proxy
+        elif CONFIG["use_tor"]:
+            proxy_config = f"socks5://127.0.0.1:{CONFIG['tor_port']}"
+        
+        connector = None
+        if proxy_config:
+            connector = aiohttp.TCPConnector()
+        
+        async with aiohttp.ClientSession(connector=connector) as session:
+            # Calculate number of pages needed
+            results_per_page = 10
+            pages_needed = min((num_results + results_per_page - 1) // results_per_page, 5)  # Max 5 pages
+            
+            for page in range(pages_needed):
+                offset = page * 10
+                params = {
+                    "q": query,
+                    "first": offset + 1,
+                    "count": results_per_page,
+                    "FORM": "PERE"
+                }
+                
+                retries = 0
+                while retries < CONFIG["max_retries"]:
+                    try:
+                        # Random delay to avoid detection
+                        await asyncio.sleep(random.uniform(*CONFIG["request_delay"]))
+                        
+                        async with session.get(
+                            self.base_url,
+                            params=params,
+                            headers=headers,
+                            proxy=proxy_config,
+                            timeout=aiohttp.ClientTimeout(total=CONFIG["timeout"]),
+                            ssl=False
+                        ) as response:
+                            if response.status != 200:
+                                logger.warning(f"Bing returned status {response.status}")
+                                retries += 1
+                                continue
+                            
+                            html = await response.text()
+                            soup = BeautifulSoup(html, 'html.parser')
+                            
+                            # Parse search results
+                            search_divs = soup.find_all('li', class_='b_algo')
+                            
+                            for div in search_divs:
+                                # Extract title and URL
+                                title_elem = div.find('h2')
+                                if not title_elem:
+                                    continue
+                                
+                                title = title_elem.get_text()
+                                
+                                # Extract URL
+                                link_elem = div.find('a')
+                                if not link_elem or not link_elem.has_attr('href'):
+                                    continue
+                                
+                                url = link_elem['href']
+                                
+                                # Extract snippet
+                                snippet_elem = div.find('p') or div.find('div', class_='b_caption')
+                                snippet = snippet_elem.get_text() if snippet_elem else ""
+                                
+                                results.append(SearchResult(
+                                    title=title,
+                                    url=url,
+                                    snippet=snippet,
+                                    engine="Bing"
+                                ))
+                                
+                                if len(results) >= num_results:
+                                    return results
+                            
+                            # If we got results, break the retry loop
+                            break
+                            
+                    except Exception as e:
+                        logger.error(f"Error searching Bing: {e}")
+                        retries += 1
+                        await asyncio.sleep(2 ** retries)  # Exponential backoff
+        
+        return results
 
-def get_price(book):
-    price = book.get("price")
-    if isinstance(price, (int, float)) and price > 0:
-        return int(price)
-    return 0
+class YahooSearchEngine(SearchEngine):
+    """Yahoo search implementation using scraping"""
+    
+    def __init__(self):
+        self.base_url = "https://search.yahoo.com/search"
+        self.ua = UserAgent()
+    
+    async def search(self, query: str, num_results: int = 50, proxy: Optional[str] = None) -> List[SearchResult]:
+        results = []
+        headers = {
+            "User-Agent": self.ua.random,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Referer": "https://search.yahoo.com/",
+            "DNT": "1",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1"
+        }
+        
+        # Configure proxy if provided
+        proxy_config = None
+        if proxy:
+            proxy_config = proxy
+        elif CONFIG["use_tor"]:
+            proxy_config = f"socks5://127.0.0.1:{CONFIG['tor_port']}"
+        
+        connector = None
+        if proxy_config:
+            connector = aiohttp.TCPConnector()
+        
+        async with aiohttp.ClientSession(connector=connector) as session:
+            # Calculate number of pages needed
+            results_per_page = 10
+            pages_needed = min((num_results + results_per_page - 1) // results_per_page, 5)  # Max 5 pages
+            
+            for page in range(pages_needed):
+                start = page * 10
+                params = {
+                    "p": query,
+                    "b": start + 1,
+                    "pz": results_per_page,
+                    "ei": "UTF-8"
+                }
+                
+                retries = 0
+                while retries < CONFIG["max_retries"]:
+                    try:
+                        # Random delay to avoid detection
+                        await asyncio.sleep(random.uniform(*CONFIG["request_delay"]))
+                        
+                        async with session.get(
+                            self.base_url,
+                            params=params,
+                            headers=headers,
+                            proxy=proxy_config,
+                            timeout=aiohttp.ClientTimeout(total=CONFIG["timeout"]),
+                            ssl=False
+                        ) as response:
+                            if response.status != 200:
+                                logger.warning(f"Yahoo returned status {response.status}")
+                                retries += 1
+                                continue
+                            
+                            html = await response.text()
+                            soup = BeautifulSoup(html, 'html.parser')
+                            
+                            # Parse search results
+                            search_divs = soup.find_all('div', class_='algo')
+                            
+                            for div in search_divs:
+                                # Extract title and URL
+                                title_elem = div.find('h3')
+                                if not title_elem:
+                                    continue
+                                
+                                title = title_elem.get_text()
+                                
+                                # Extract URL
+                                link_elem = div.find('a')
+                                if not link_elem or not link_elem.has_attr('href'):
+                                    continue
+                                
+                                url = link_elem['href']
+                                
+                                # Extract snippet
+                                snippet_elem = div.find('p', class_='lh-16')
+                                snippet = snippet_elem.get_text() if snippet_elem else ""
+                                
+                                results.append(SearchResult(
+                                    title=title,
+                                    url=url,
+                                    snippet=snippet,
+                                    engine="Yahoo"
+                                ))
+                                
+                                if len(results) >= num_results:
+                                    return results
+                            
+                            # If we got results, break the retry loop
+                            break
+                            
+                    except Exception as e:
+                        logger.error(f"Error searching Yahoo: {e}")
+                        retries += 1
+                        await asyncio.sleep(2 ** retries)  # Exponential backoff
+        
+        return results
 
-def is_free(book):
-    return book.get("price", 0) == 0 or book.get("isFree") == True
+class YandexSearchEngine(SearchEngine):
+    """Yandex search implementation using scraping"""
+    
+    def __init__(self):
+        self.base_url = "https://yandex.com/search/touch"
+        self.ua = UserAgent()
+    
+    async def search(self, query: str, num_results: int = 50, proxy: Optional[str] = None) -> List[SearchResult]:
+        results = []
+        headers = {
+            "User-Agent": self.ua.random,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Referer": "https://yandex.com/",
+            "DNT": "1",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1"
+        }
+        
+        # Configure proxy if provided
+        proxy_config = None
+        if proxy:
+            proxy_config = proxy
+        elif CONFIG["use_tor"]:
+            proxy_config = f"socks5://127.0.0.1:{CONFIG['tor_port']}"
+        
+        connector = None
+        if proxy_config:
+            connector = aiohttp.TCPConnector()
+        
+        async with aiohttp.ClientSession(connector=connector) as session:
+            # Calculate number of pages needed
+            results_per_page = 10
+            pages_needed = min((num_results + results_per_page - 1) // results_per_page, 5)  # Max 5 pages
+            
+            for page in range(pages_needed):
+                start = page * 10
+                params = {
+                    "text": query,
+                    "p": start,
+                    "numdoc": results_per_page
+                }
+                
+                retries = 0
+                while retries < CONFIG["max_retries"]:
+                    try:
+                        # Random delay to avoid detection
+                        await asyncio.sleep(random.uniform(*CONFIG["request_delay"]))
+                        
+                        async with session.get(
+                            self.base_url,
+                            params=params,
+                            headers=headers,
+                            proxy=proxy_config,
+                            timeout=aiohttp.ClientTimeout(total=CONFIG["timeout"]),
+                            ssl=False
+                        ) as response:
+                            if response.status != 200:
+                                logger.warning(f"Yandex returned status {response.status}")
+                                retries += 1
+                                continue
+                            
+                            html = await response.text()
+                            soup = BeautifulSoup(html, 'html.parser')
+                            
+                            # Parse search results
+                            search_divs = soup.find_all('li', class_='serp-item')
+                            
+                            for div in search_divs:
+                                # Extract title and URL
+                                title_elem = div.find('h2')
+                                if not title_elem:
+                                    continue
+                                
+                                title = title_elem.get_text()
+                                
+                                # Extract URL
+                                link_elem = div.find('a')
+                                if not link_elem or not link_elem.has_attr('href'):
+                                    continue
+                                
+                                url = link_elem['href']
+                                
+                                # Extract snippet
+                                snippet_elem = div.find('div', class_='organic__content-wrapper')
+                                snippet = snippet_elem.get_text() if snippet_elem else ""
+                                
+                                results.append(SearchResult(
+                                    title=title,
+                                    url=url,
+                                    snippet=snippet,
+                                    engine="Yandex"
+                                ))
+                                
+                                if len(results) >= num_results:
+                                    return results
+                            
+                            # If we got results, break the retry loop
+                            break
+                            
+                    except Exception as e:
+                        logger.error(f"Error searching Yandex: {e}")
+                        retries += 1
+                        await asyncio.sleep(2 ** retries)  # Exponential backoff
+        
+        return results
 
-def parse_user_input(inp: str, total_books: int) -> List[int]:
-    if not inp: return []
-    indices = []
-    parts = inp.replace(" ", "").split(",")
-    for part in parts:
-        if "-" in part:
-            try:
-                a, b = map(int, part.split("-"))
-                indices.extend(range(max(1, a), min(total_books, b) + 1))
-            except: continue
+class DuckDuckGoSearchEngine(SearchEngine):
+    """DuckDuckGo search implementation using scraping"""
+    
+    def __init__(self):
+        self.base_url = "https://html.duckduckgo.com/html/"
+        self.ua = UserAgent()
+    
+    async def search(self, query: str, num_results: int = 50, proxy: Optional[str] = None) -> List[SearchResult]:
+        results = []
+        headers = {
+            "User-Agent": self.ua.random,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Referer": "https://duckduckgo.com/",
+            "DNT": "1",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1"
+        }
+        
+        # Configure proxy if provided
+        proxy_config = None
+        if proxy:
+            proxy_config = proxy
+        elif CONFIG["use_tor"]:
+            proxy_config = f"socks5://127.0.0.1:{CONFIG['tor_port']}"
+        
+        connector = None
+        if proxy_config:
+            connector = aiohttp.TCPConnector()
+        
+        async with aiohttp.ClientSession(connector=connector) as session:
+            # Calculate number of pages needed
+            results_per_page = 30
+            pages_needed = min((num_results + results_per_page - 1) // results_per_page, 5)  # Max 5 pages
+            
+            for page in range(pages_needed):
+                s = page * results_per_page
+                params = {
+                    "q": query,
+                    "s": s,
+                    "dc": s + results_per_page,
+                    "v": "l",
+                    "o": "json",
+                    "api": "/d.js"
+                }
+                
+                retries = 0
+                while retries < CONFIG["max_retries"]:
+                    try:
+                        # Random delay to avoid detection
+                        await asyncio.sleep(random.uniform(*CONFIG["request_delay"]))
+                        async with session.get(
+                            self.base_url,
+                            params=params,
+                            headers=headers,
+                            proxy=proxy_config,
+                            timeout=aiohttp.ClientTimeout(total=CONFIG["timeout"]),
+                            ssl=False
+                        ) as response:
+                            if response.status != 200:
+                                logger.warning(f"DuckDuckGo returned status {response.status}")
+                                retries += 1
+                                continue
+                            
+                            html = await response.text()
+                            soup = BeautifulSoup(html, 'html.parser')
+                            
+                            # Parse search results
+                            search_divs = soup.find_all('div', class_='result')
+                            
+                            for div in search_divs:
+                                # Extract title and URL
+                                title_elem = div.find('a', class_='result__a')
+                                if not title_elem:
+                                    continue
+                                
+                                title = title_elem.get_text()
+                                
+                                # Extract URL
+                                url = title_elem['href']
+                                
+                                # Extract snippet
+                                snippet_elem = div.find('a', class_='result__snippet')
+                                snippet = snippet_elem.get_text() if snippet_elem else ""
+                                
+                                results.append(SearchResult(
+                                    title=title,
+                                    url=url,
+                                    snippet=snippet,
+                                    engine="DuckDuckGo"
+                                ))
+                                
+                                if len(results) >= num_results:
+                                    return results
+                            
+                            # If we got results, break the retry loop
+                            break
+                            
+                    except Exception as e:
+                        logger.error(f"Error searching DuckDuckGo: {e}")
+                        retries += 1
+                        await asyncio.sleep(2 ** retries)  # Exponential backoff
+        
+        return results
+
+class DorkParserBot:
+    """Main bot class for handling Telegram interactions"""
+    
+    def __init__(self):
+        self.search_engines = {
+            "google": GoogleSearchEngine(),
+            "bing": BingSearchEngine(),
+            "yahoo": YahooSearchEngine(),
+            "yandex": YandexSearchEngine(),
+            "duckduckgo": DuckDuckGoSearchEngine()
+        }
+        self.active_searches = {}  # Track active searches by user_id
+        self.executor = ThreadPoolExecutor(max_workers=CONFIG["max_concurrent_searches"])
+    
+    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle the /start command"""
+        welcome_message = (
+            "🔍 *Advanced Dork Parser Bot*\n\n"
+            "I can help you search across multiple search engines using advanced dorks.\n\n"
+            "Commands:\n"
+            "/search - Search with a single dork\n"
+            "/file - Upload a .txt file with multiple dorks\n"
+            "/engines - List available search engines\n"
+            "/proxy - Set proxy for searches\n"
+            "/help - Get help\n\n"
+            "Simply send me a dork or upload a .txt file with multiple dorks to get started!"
+        )
+        
+        await update.message.reply_text(
+            welcome_message,
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle the /help command"""
+        help_message = (
+            "🔍 *Advanced Dork Parser Bot Help*\n\n"
+            "*Basic Usage:*\n"
+            "• Send a dork directly to the bot to search\n"
+            "• Use /file to upload a .txt file with multiple dorks\n\n"
+            "*Advanced Features:*\n"
+            "• Use /proxy to set a proxy for all searches\n"
+            "• Use /engines to select specific search engines\n"
+            "• Results are combined and deduplicated\n\n"
+            "*Dork Examples:*\n"
+            "• `site:example.com`\n"
+            "• `inurl:admin filetype:pdf`\n"
+            "*Tips:*\n"
+            "• Use quotes for exact phrases\n"
+            "• Combine operators for better results\n"
+            "• Upload multiple dorks in a .txt file for batch processing"
+        )
+        
+        await update.message.reply_text(
+            help_message,
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+
+        
+
+
+
+
+
+    async def search_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle the /search command"""
+        # Check if user provided a query after /search
+        if context.args:
+            query = " ".join(context.args)
+            await self.process_search(update, context, [query])
         else:
-            try:
-                idx = int(part)
-                if 1 <= idx <= total_books:
-                    indices.append(idx)
-            except: continue
-    return sorted(list(set(indices)))
+            await update.message.reply_text(
+                "Please provide a dork to search.\n\n"
+                "Example: `/search site:example.com`\n"
+                "Example: `/search inurl:admin filetype:pdf`",
+                parse_mode=ParseMode.MARKDOWN
+            )
 
-# ───────────────── API FUNCTIONS ─────────────────
-def get_all_books():
-    data = fetch_json(EBOOKS_API)
-    return data if isinstance(data, list) else []
 
-def get_chapters(book_id):
-    url = EBOOK_CHAPTERS_API.format(book_id=book_id)
-    data = fetch_json(url, timeout=12)
-    if isinstance(data, list):
-        return sorted(data, key=lambda x: x.get("sequence", 999))
-    return []
 
-def get_chapter_pdf(chapter_id):
-    url = EBOOK_PDFS_API.format(chapter_id=chapter_id)
-    data = fetch_json(url, timeout=8)
-    return data[0] if isinstance(data, list) and data else None
 
-# ───────────────── CORE: DOWNLOAD & MERGE ─────────────────
-async def download_and_merge_pdf(book, chat_id, bot, progress_msg_id):
-    """Downloads chapters, merges them, and updates progress message."""
-    book_id = book.get("_id")
-    full_title = book.get("title", "Unknown")
-    chapters = get_chapters(book_id)
+
+
+
+
+
     
-    if not chapters:
-        return None, 0, 0
-    
-    safe_title = sanitize(full_title)
-    final_pdf_path = os.path.join(OUTPUT_DIR, f"{safe_title}_Merged.pdf")
-    
-    pdf_writer = PdfWriter()
-    pdf_count = 0
-    total_ch = len(chapters)
-    
-    log.info(f"Starting merge for: {full_title}")
-    
-    for idx, ch in enumerate(chapters, 1):
-        ch_title = ch.get("title", "Unknown")
-        ch_id = ch.get("_id")
+    async def engines_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle the /engines command"""
+        keyboard = []
         
-        # Update Progress Message
-        percent = int((idx / total_ch) * 100)
-        progress_text = (
-            f"⏳ <b>Processing:</b> {truncate(full_title, 40)}\n"
-            f"📥 Merged: <b>{idx}/{total_ch}</b> Chapters ({percent}%)\n"
-            f" Current: {truncate(ch_title, 35)}\n"
-            f"<i>Please wait, do not spam...</i>"
+        for engine_name in self.search_engines.keys():
+            keyboard.append([InlineKeyboardButton(
+                engine_name.capitalize(),
+                callback_data=f"toggle_engine:{engine_name}"
+            )])
+        
+        keyboard.append([InlineKeyboardButton("Search All", callback_data="toggle_engine:all")])
+        keyboard.append([InlineKeyboardButton("Done", callback_data="engines_done")])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            "Select search engines to use:",
+            reply_markup=reply_markup
         )
-        try:
-            await bot.edit_message_text(chat_id, progress_msg_id, progress_text)
-        except Exception:
-            pass # Ignore if message was deleted or flood wait
-        
-        pdf_info = get_chapter_pdf(ch_id)
-        if pdf_info and pdf_info.get("s3Key"):
-            s3_key = pdf_info.get("s3Key")
-            pdf_url = CLOUDFRONT_BASE.format(s3_key=s3_key)
-            temp_pdf_path = os.path.join(OUTPUT_DIR, f"temp_{ch_id}.pdf")
-            
-            try:
-                sess = create_session()
-                with sess.get(pdf_url, stream=True, timeout=60) as r:
-                    r.raise_for_status()
-                    with open(temp_pdf_path, 'wb') as f:
-                        for chunk in r.iter_content(chunk_size=8192):
-                            f.write(chunk)
-                
-                pdf_writer.append(temp_pdf_path)
-                pdf_count += 1
-                
-                # Delete temp file immediately to save Heroku/Server disk space
-                if os.path.exists(temp_pdf_path):
-                    os.remove(temp_pdf_path)
-                    
-            except Exception as e:
-                log.error(f"Failed to download/merge {ch_title}: {e}")
-                if os.path.exists(temp_pdf_path):
-                    os.remove(temp_pdf_path)
-            
-            await asyncio.sleep(0.1) # Prevent rate limiting
-            
-    # Save final merged PDF
-    if pdf_count > 0:
-        with open(final_pdf_path, "wb") as f_out:
-            pdf_writer.write(f_out)
-        log.info(f"Successfully merged {pdf_count}/{total_ch} chapters into {final_pdf_path}")
-        return final_pdf_path, pdf_count, total_ch
-    else:
-        log.warning(f"No PDFs could be downloaded for {full_title}")
-        return None, 0, total_ch
-
-# ──────────────── PYROGRAM BOT SETUP ─────────────────
-app = Client("PinnacleMergedBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-
-@app.on_message(filters.command("start") & filters.private)
-async def start_command(client: Client, message: Message):
-    chat_id = message.chat.id
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
     
-    wait_msg = await message.reply_text("🔄 Fetching available batches... Please wait.")
-    
-    books = await asyncio.to_thread(get_all_books)
-    if not books:
-        return await wait_msg.edit_text("❌ Failed to fetch ebooks! Check API connection or Token.")
-    
-    total = len(books)
-    await wait_msg.delete()
-    
-    # Create list file
-    list_file = os.path.join(OUTPUT_DIR, "Pinnacle_Ebooks_List.txt")
-    with open(list_file, "w", encoding="utf-8") as f:
-        f.write("📚 Pinnacle Available Ebooks\n\n")
-        for i, book in enumerate(books, 1):
-            title = truncate(book.get("title", "Unknown"), 60)
-            price_tag = "🟡 Free" if is_free(book) else f"{get_price(book)}"
-            f.write(f"{i}] {title} ({price_tag})\n")
-    
-    caption = (
-        f"📚 <b>Total Available Batches: {total}</b>\n\n"
-        f"👇 <b>Reply with book number(s) to get Merged PDF:</b>\n\n"
-        f"<b>Examples:</b>\n"
-        f"• <code>5</code> → Only book #5\n"
-        f"• <code>1,3,5</code> → Books 1, 3, and 5\n"
-        f"• <code>10-15</code> → Books 10 to 15\n\n"
-        f"<i>⚠️ Note: Large books may take 1-3 minutes to merge.</i>"
-    )
-    
-    await message.reply_document(
-        document=list_file,
-        file_name="Pinnacle_Ebooks_List.txt",
-        caption=caption
-    )
-    if os.path.exists(list_file):
-        os.remove(list_file)
-
-@app.on_message(filters.text & filters.private & ~filters.command("start"))
-async def handle_selection(client: Client, message: Message):
-    chat_id = message.chat.id
-    user_input = message.text.strip()
-    
-    # Fetch books again to ensure fresh data
-    books = await asyncio.to_thread(get_all_books)
-    if not books:
-        return await message.reply_text("❌ Failed to fetch books. Try /start again.")
-    
-    total = len(books)
-    indices = parse_user_input(user_input, total)
-    
-    if not indices:
-        return await message.reply_text("❌ Invalid input! Use formats like: `1`, `1,3,5`, or `10-15`")
-    
-    # Acknowledge request
-    ack_msg = await message.reply_text(f"✅ Received! Processing {len(indices)} book(s). This will take some time...")
-    await asyncio.sleep(1)
-    await ack_msg.delete()
-    
-    success_count = 0
-    
-    for idx in indices:
-        if idx > len(books): continue
-        book = books[idx - 1]
-        full_title = book.get("title", "Unknown")
-        book_id = book.get("_id")
-        price = get_price(book) if not is_free(book) else "Free"
-        image_url = book.get("image", "")
-        
-        # 🟢 NEW: Download Thumbnail for PDF
-        thumb_path = None
-        if image_url and image_url.startswith("http"):
-            try:
-                thumb_path = os.path.join(OUTPUT_DIR, f"thumb_{idx}.jpg")
-                sess = create_session()
-                with sess.get(image_url, stream=True, timeout=30) as r:
-                    r.raise_for_status()
-                    with open(thumb_path, 'wb') as f:
-                        for chunk in r.iter_content(chunk_size=8192):
-                            f.write(chunk)
-            except Exception as e:
-                log.error(f"Thumbnail download failed for {full_title}: {e}")
-                thumb_path = None
-
-        # 1. Send Photo + Details First
-        details_caption = (
-            f"📚 <b>{full_title}</b>\n\n"
-            f"💸 <b>Price:</b> ₹{price}\n"
+    async def proxy_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle the /proxy command"""
+        await update.message.reply_text(
+            "Please send your proxy in one of these formats:\n\n"
+            "• HTTP: `http://user:pass@host:port`\n"
+            "• SOCKS5: `socks5://user:pass@host:port`\n\n"
+            "Or send `disable` to stop using a proxy."
         )
         
-        try:
-            if image_url and image_url.startswith("http"):
-                await client.send_photo(chat_id, photo=image_url, caption=details_caption)
+        # Store that we're waiting for a proxy
+        context.user_data["waiting_for_proxy"] = True
+    
+    async def file_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle the /file command"""
+        await update.message.reply_text(
+            "Please upload a .txt file with one dork per line.\n\n"
+            "The file should contain dorks like:\n"
+            "site:example.com\n"
+            "inurl:admin filetype:pdf\n"
+            "intitle:\"index of\" \"parent directory\""
+        )
+        
+        # Store that we're waiting for a file
+        context.user_data["waiting_for_file"] = True
+    
+    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle text messages"""
+        text = update.message.text
+        
+        # Check if we're waiting for a proxy
+        if context.user_data.get("waiting_for_proxy"):
+            context.user_data["waiting_for_proxy"] = False
+            
+            if text.lower() == "disable":
+                context.user_data["proxy"] = None
+                await update.message.reply_text("Proxy disabled.")
             else:
-                await client.send_message(chat_id, details_caption)
-        except Exception as e:
-            log.error(f"Failed to send photo: {e}")
-            await client.send_message(chat_id, details_caption)
+                # Validate proxy format
+                if text.startswith(("http://", "https://", "socks5://")):
+                    context.user_data["proxy"] = text
+                    await update.message.reply_text(f"Proxy set: {text}")
+                else:
+                    await update.message.reply_text("Invalid proxy format. Please try again.")
+            return
         
-        # 2. Send Progress Message
-        progress_msg = await client.send_message(
-            chat_id, 
-            f"⏳ <b>Initializing merge for:</b> {truncate(full_title, 40)}\n🔄 Please wait..."
-        )
-        
-        # 3. Download & Merge
-        merged_pdf_path, pdf_cnt, ch_cnt = await download_and_merge_pdf(book, chat_id, client, progress_msg.id)
-        
-        if not merged_pdf_path:
-            await progress_msg.edit_text(f"❌ Failed to merge <b>{full_title}</b>. No chapters found or API error.")
-            await asyncio.sleep(2)
-            # Clean up thumb if merge fails
-            if thumb_path and os.path.exists(thumb_path):
-                os.remove(thumb_path)
-            continue
-        
-        # 4. Upload Final Merged PDF (UPDATED WITH THUMB)
-        final_caption = (
-            f"📚 <b>Book:</b> {full_title}\n\n"
-            f"📄 <b>Chapters :</b> {pdf_cnt}\n\n"
-            f"<i>Powered by @PinnacleallEbook</i>"
-        )
-        
-        try:
-            await client.send_document(
-                chat_id=chat_id,
-                document=merged_pdf_path,
-                file_name=os.path.basename(merged_pdf_path),
-                caption=final_caption,
-                thumb=thumb_path  # 👈 यहाँ थंबनेल जोड़ा गया
-            )
-            success_count += 1
-        except FloodWait as e:
-            await client.send_message(chat_id, f"⏳ FloodWait: Waiting for {e.value} seconds...")
-            await asyncio.sleep(e.value)
-            await client.send_document(
-                chat_id=chat_id, 
-                document=merged_pdf_path, 
-                caption=final_caption,
-                thumb=thumb_path  # 👈 FloodWait में भी थंबनेल जोड़ा गया
-            )
-            success_count += 1
-        except Exception as e:
-            log.error(f"Failed to upload PDF: {e}")
-            await client.send_message(chat_id, f"❌ Failed to upload {full_title}. Error: {e}")
-        
-        # 5. Delete Progress Message
-        try:
-            await progress_msg.delete()
-        except Exception:
-            pass
-        
-        # 6. Clean up merged PDF & Thumbnail from server to save space
-        if os.path.exists(merged_pdf_path):
-            os.remove(merged_pdf_path)
-            
-        if thumb_path and os.path.exists(thumb_path):
-            os.remove(thumb_path)
-            
-        # Small delay between books to prevent API rate limits
-        await asyncio.sleep(1.5)
+        # Otherwise, treat as a search query
+        await self.process_search(update, context, [text])
     
-    # Final Summary
-    await message.reply_text(
-        f"🎉 <b>Task Completed!</b>\n\n"
-        f"✅ Successfully processed and sent: <b>{success_count}</b> book(s).\n"
-        f"❌ Failed/Skipped: <b>{len(indices) - success_count}</b> book(s)."
-    )
+    async def handle_document(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle document uploads"""
+        document = update.message.document
+        
+        # Check if we're waiting for a file
+        if not context.user_data.get("waiting_for_file"):
+            await update.message.reply_text(
+                "Please use the /file command first before uploading a file."
+            )
+            return
+        
+        context.user_data["waiting_for_file"] = False
+        
+        # Check file type and size
+        if not document.file_name.endswith('.txt'):
+            await update.message.reply_text("Please upload a .txt file.")
+            return
+        
+        if document.file_size > CONFIG["max_file_size"]:
+            await update.message.reply_text(
+                f"File too large. Maximum size is {CONFIG['max_file_size'] / (1024*1024):.1f}MB."
+            )
+            return
+        
+        # Download and process the file
+        try:
+            file = await context.bot.get_file(document.file_id)
+            
+            # Create a temporary file
+            temp_file = f"temp_{document.file_name}"
+            await file.download_to_drive(temp_file)
+            
+            # Read dorks from file
+            async with aiofiles.open(temp_file, 'r') as f:
+                content = await f.read()
+                dorks = [line.strip() for line in content.split('\n') if line.strip()]
+            
+            # Clean up temp file
+            await aiofiles.os.remove(temp_file)
+            
+            if not dorks:
+                await update.message.reply_text("No dorks found in the file.")
+                return
+            
+            await update.message.reply_text(
+                f"Found {len(dorks)} dorks in the file. Starting search..."
+            )
+            
+            # Process the search
+            await self.process_search(update, context, dorks)
+            
+        except Exception as e:
+            logger.error(f"Error processing file: {e}")
+            await update.message.reply_text("Error processing file. Please try again.")
+    
+    async def process_search(self, update: Update, context: ContextTypes.DEFAULT_TYPE, dorks: List[str]) -> None:
+        """Process search queries"""
+        user_id = update.effective_user.id
+        
+        # Get selected engines or use all
+        selected_engines = context.user_data.get("selected_engines", list(self.search_engines.keys()))
+        proxy = context.user_data.get("proxy")
+        
+        # Create progress tracking
+        progress = SearchProgress(
+            total=len(dorks) * len(selected_engines),
+            completed=0,
+            current_engine="",
+            message_id=0
+        )
+        
+        # Send initial progress message
+        progress_message = await update.message.reply_text(
+            f"🔍 Starting search with {len(dorks)} dorks across {len(selected_engines)} engines...",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Cancel", callback_data=f"cancel_search:{user_id}")]
+            ])
+        )
+        progress.message_id = progress_message.message_id
+        
+        # Store progress for this user
+        self.active_searches[user_id] = {
+            "progress": progress,
+            "results": [],
+            "cancelled": False
+        }
+        
+        # Start the search in the background
+        asyncio.create_task(self.run_search(update, context, dorks, selected_engines, proxy, user_id))
+    
+    async def run_search(self, update: Update, context: ContextTypes.DEFAULT_TYPE, 
+                        dorks: List[str], engines: List[str], proxy: Optional[str], user_id: int) -> None:
+        """Run the actual search process"""
+        user_search = self.active_searches.get(user_id)
+        if not user_search:
+            return
+        
+        progress = user_search["progress"]
+        results = user_search["results"]
+        
+        try:
+            # Process each dork
+            for i, dork in enumerate(dorks):
+                # Check if search was cancelled
+                if user_search["cancelled"]:
+                    await context.bot.edit_message_text(
+                        chat_id=update.effective_chat.id,
+                        message_id=progress.message_id,
+                        text="❌ Search cancelled."
+                    )
+                    return
+                
+                # Update progress
+                progress.current_engine = f"Processing dork {i+1}/{len(dorks)}"
+                await self.update_progress(update, context, progress)
+                
+                # Search each engine
+                for engine_name in engines:
+                    # Check if search was cancelled
+                    if user_search["cancelled"]:
+                        await context.bot.edit_message_text(
+                            chat_id=update.effective_chat.id,
+                            message_id=progress.message_id,
+                            text="❌ Search cancelled."
+                        )
+                        return
+                    
+                    # Update progress
+                    progress.current_engine = f"Searching {engine_name.capitalize()} for dork {i+1}/{len(dorks)}"
+                    await self.update_progress(update, context, progress)
+                    
+                    try:
+                        # Get the search engine
+                        engine = self.search_engines.get(engine_name)
+                        if not engine:
+                            continue
+                        
+                        # Perform search
+                        engine_results = await engine.search(
+                            dork, 
+                            num_results=CONFIG["default_results_per_engine"],
+                            proxy=proxy
+                        )
+                        
+                        # Add results to our collection
+                        results.extend(engine_results)
+                        
+                        # Update progress
+                        progress.completed += 1
+                        await self.update_progress(update, context, progress)
+                        
+                    except Exception as e:
+                        logger.error(f"Error searching {engine_name}: {e}")
+                        # Still update progress
+                        progress.completed += 1
+                        await self.update_progress(update, context, progress)
+            
+            # Process and deduplicate results
+            unique_results = self.deduplicate_results(results)
+            
+            # Send final results
+            await self.send_results(update, context, unique_results, dorks)
+            
+        except Exception as e:
+            logger.error(f"Error in search process: {e}")
+            await context.bot.edit_message_text(
+                chat_id=update.effective_chat.id,
+                message_id=progress.message_id,
+                text=f"❌ Error during search: {str(e)}"
+            )
+        finally:
+            # Clean up
+            if user_id in self.active_searches:
+                del self.active_searches[user_id]
+    
+    async def update_progress(self, update: Update, context: ContextTypes.DEFAULT_TYPE, 
+                            progress: SearchProgress) -> None:
+        """Update the progress message"""
+        try:
+            percentage = (progress.completed / progress.total) * 100 if progress.total > 0 else 0
+            progress_bar = "█" * int(percentage / 5) + "░" * (20 - int(percentage / 5))
+            
+            await context.bot.edit_message_text(
+                chat_id=update.effective_chat.id,
+                message_id=progress.message_id,
+                text=f"🔍 Searching...\n\n"
+                     f"Progress: {progress_bar} {percentage:.1f}%\n"
+                     f"Completed: {progress.completed}/{progress.total}\n"
+                     f"Current: {progress.current_engine}",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Cancel", callback_data=f"cancel_search:{update.effective_user.id}")]
+                ])
+            )
+        except Exception as e:
+            logger.error(f"Error updating progress: {e}")
+    
+    def deduplicate_results(self, results: List[SearchResult]) -> List[SearchResult]:
+        """Deduplicate results by URL"""
+        seen_urls = set()
+        unique_results = []
+        
+        for result in results:
+            # Normalize URL for comparison
+            url = result.url.lower()
+            if url not in seen_urls:
+                seen_urls.add(url)
+                unique_results.append(result)
+        
+        return unique_results
+    
+    async def send_results(self, update: Update, context: ContextTypes.DEFAULT_TYPE, 
+                          results: List[SearchResult], dorks: List[str]) -> None:
+        """Send the search results"""
+        user_id = update.effective_user.id
+        user_search = self.active_searches.get(user_id)
+        
+        if not user_search:
+            return
+        
+        progress = user_search["progress"]
+        
+        # Update progress message to show completion
+        await context.bot.edit_message_text(
+            chat_id=update.effective_chat.id,
+            message_id=progress.message_id,
+            text=f"✅ Search completed! Found {len(results)} unique results."
+        )
+        
+        if not results:
+            await update.message.reply_text("No results found for the given dorks.")
+            return
+        
+        # Group results by engine
+        results_by_engine = {}
+        for result in results:
+            if result.engine not in results_by_engine:
+                results_by_engine[result.engine] = []
+            results_by_engine[result.engine].append(result)
+        
+        # Create a summary message
+        summary = f"🔍 *Search Results*\n\n"
+        summary += f"Dorks searched: {len(dorks)}\n"
+        summary += f"Total unique results: {len(results)}\n\n"
+        
+        for engine, engine_results in results_by_engine.items():
+            summary += f"{engine.capitalize()}: {len(engine_results)} results\n"
+        
+        summary += "\n*Top Results:*\n"
+        
+        # Add top 5 results
+        for i, result in enumerate(results[:5]):
+            summary += f"\n{i+1}. [{result.title}]({result.url})\n"
+            summary += f"   {result.snippet[:100]}{'...' if len(result.snippet) > 100 else ''}\n"
+            summary += f"   _Source: {result.engine}_\n"
+        
+        await update.message.reply_text(
+            summary,
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True
+        )
+        
+        # Create a file with all results
+        await self.create_results_file(update, context, results, dorks)
+    
+    async def create_results_file(self, update: Update, context: ContextTypes.DEFAULT_TYPE, 
+                                results: List[SearchResult], dorks: List[str]) -> None:
+        """Create a file with all results"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"dork_results_{timestamp}.txt"
+        
+        try:
+            # Create the file content
+            content = f"Advanced Dork Parser Results\n"
+            content += f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            content += f"Dorks searched: {len(dorks)}\n"
+            content += f"Total results: {len(results)}\n\n"
+            
+            content += "Dorks:\n"
+            for i, dork in enumerate(dorks, 1):
+                content += f"{i}. {dork}\n"
+            
+            content += "\nResults:\n\n"
+            
+            # Group results by engine
+            results_by_engine = {}
+            for result in results:
+                if result.engine not in results_by_engine:
+                    results_by_engine[result.engine] = []
+                results_by_engine[result.engine].append(result)
+            
+            for engine, engine_results in results_by_engine.items():
+                content += f"=== {engine.upper()} RESULTS ===\n\n"
+                
+                for i, result in enumerate(engine_results, 1):
+                    content += f"{i}. {result.title}\n"
+                    content += f"   URL: {result.url}\n"
+                    content += f"   Snippet: {result.snippet}\n\n"
+            
+            # Write to file
+            async with aiofiles.open(filename, 'w') as f:
+                await f.write(content)
+            
+            # Send the file
+            await context.bot.send_document(
+                chat_id=update.effective_chat.id,
+                document=open(filename, 'rb'),
+                caption=f"Complete results for {len(dorks)} dorks"
+            )
+            
+            # Clean up
+            await aiofiles.os.remove(filename)
+            
+        except Exception as e:
+            logger.error(f"Error creating results file: {e}")
+            await update.message.reply_text("Error creating results file.")
+    
+    async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle button callbacks"""
+        query = update.callback_query
+        await query.answer()
+        
+        data = query.data
+        
+        if data.startswith("toggle_engine:"):
+            engine_name = data.split(":", 1)[1]
+            
+            if engine_name == "all":
+                # Toggle all engines
+                if len(context.user_data.get("selected_engines", [])) == len(self.search_engines):
+                    # If all are selected, deselect all
+                    context.user_data["selected_engines"] = []
+                else:
+                    # Select all
+                    context.user_data["selected_engines"] = list(self.search_engines.keys())
+            else:
+                # Toggle specific engine
+                selected_engines = context.user_data.get("selected_engines", [])
+                
+                if engine_name in selected_engines:
+                    selected_engines.remove(engine_name)
+                else:
+                    selected_engines.append(engine_name)
+                
+                context.user_data["selected_engines"] = selected_engines
+            
+            # Update the message
+            await self.update_engines_message(query, context)
+            
+        elif data == "engines_done":
+            await query.edit_message_text("Search engines selection saved.")
+            
+        elif data.startswith("cancel_search:"):
+            user_id = int(data.split(":", 1)[1])
+            
+            if user_id in self.active_searches:
+                self.active_searches[user_id]["cancelled"] = True
+    
+    async def update_engines_message(self, query, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Update the engines selection message"""
+        selected_engines = context.user_data.get("selected_engines", [])
+        
+        keyboard = []
+        
+        for engine_name in self.search_engines.keys():
+            is_selected = engine_name in selected_engines
+            keyboard.append([InlineKeyboardButton(
+                f"{'✅ ' if is_selected else ''}{engine_name.capitalize()}",
+                callback_data=f"toggle_engine:{engine_name}"
+            )])
+        
+        keyboard.append([InlineKeyboardButton("Search All", callback_data="toggle_engine:all")])
+        keyboard.append([InlineKeyboardButton("Done", callback_data="engines_done")])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            "Select search engines to use:",
+            reply_markup=reply_markup
+        )
+    
+    async def create_results_file(self, update: Update, context: ContextTypes.DEFAULT_TYPE, 
+                                results: List[SearchResult], dorks: List[str]) -> None:
+        """Create a file with only URLs from all results"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"dork_urls_{timestamp}.txt"
+        
+        try:
+            # Create the file content with only URLs
+            content = f"Advanced Dork Parser - URLs Only\n"
+            content += f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            content += f"Dorks searched: {len(dorks)}\n"
+            content += f"Total URLs: {len(results)}\n\n"
+            
+            content += "Dorks used:\n"
+            for i, dork in enumerate(dorks, 1):
+                content += f"{i}. {dork}\n"
+            
+            content += "\n" + "="*50 + "\n\n"
+            content += "URLs:\n\n"
+            
+            # Group URLs by engine
+            urls_by_engine = {}
+            for result in results:
+                if result.engine not in urls_by_engine:
+                    urls_by_engine[result.engine] = set()
+                urls_by_engine[result.engine].add(result.url)
+            
+            for engine, urls in urls_by_engine.items():
+                content += f"=== {engine.upper()} URLs ===\n"
+                for url in sorted(urls):
+                    content += f"{url}\n"
+                content += "\n"
+            
+            # Also add all URLs without duplicates at the end
+            content += "="*50 + "\n\n"
+            content += "ALL UNIQUE URLS:\n\n"
+            
+            all_urls = set()
+            for result in results:
+                all_urls.add(result.url)
+            
+            for url in sorted(all_urls):
+                content += f"{url}\n"
+            
+            # Write to file
+            async with aiofiles.open(filename, 'w') as f:
+                await f.write(content)
+            
+            # Send the file
+            await context.bot.send_document(
+                chat_id=update.effective_chat.id,
+                document=open(filename, 'rb'),
+                caption=f"URLs only - {len(all_urls)} unique URLs from {len(dorks)} dorks"
+            )
+            
+            # Clean up
+            await aiofiles.os.remove(filename)
+            
+        except Exception as e:
+            logger.error(f"Error creating results file: {e}")
+            await update.message.reply_text("Error creating results file.")
+    
+    def run(self) -> None:
+        """Run the bot"""
+        application = Application.builder().token(CONFIG["telegram_token"]).build()
+        
+        # Add handlers
+        application.add_handler(CommandHandler("start", self.start_command))
+        application.add_handler(CommandHandler("help", self.help_command))
+        application.add_handler(CommandHandler("engines", self.engines_command))
+        application.add_handler(CommandHandler("proxy", self.proxy_command))
+        application.add_handler(CommandHandler("file", self.file_command))
+        
+        # ✅ YE LINE ADD KAREIN:
+        application.add_handler(CommandHandler("search", self.search_command)) 
+        
+        application.add_handler(CallbackQueryHandler(self.button_callback))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
+        application.add_handler(MessageHandler(filters.Document.ALL, self.handle_document))
+        
+        # Run the bot
+        application.run_polling()
 
-# ───────────────── RUN BOT ─────────────────
+def main():
+    """Main function to start the bot"""
+    bot = DorkParserBot()
+    bot.run()
+
 if __name__ == "__main__":
-    log.info("🚀 Starting Pinnacle Merged PDF Bot...")
-    app.run()
+    main()
+                       

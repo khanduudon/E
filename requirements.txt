@@ -3,3 +3,4 @@ tgcrypto
 requests
 pypdf
 urllib3
+aiohttp

@@ -5,3 +5,4 @@ pypdf
 urllib3
 aiohttp
 aiofiles
+beautifulsoup4

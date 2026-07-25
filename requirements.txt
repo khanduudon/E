@@ -6,3 +6,4 @@ urllib3
 aiohttp
 aiofiles
 beautifulsoup4
+fake-useragent
